@@ -40,7 +40,11 @@ jobs:
           set(DOBBY_GENERATE_SHARED OFF CACHE BOOL "" FORCE)
           add_subdirectory(Dobby dobby_build)
           add_library(gpuspoof SHARED main.cpp)
-          target_link_libraries(gpuspoof dobby log)
+          if(TARGET dobby_static)
+            target_link_libraries(gpuspoof dobby_static log)
+          else()
+            target_link_libraries(gpuspoof dobby log)
+          endif()
           EOF
 
           cat > src/main.cpp <<'EOF'
@@ -198,23 +202,28 @@ jobs:
           ZH="$(find /tmp/zsample -name zygisk.hpp | head -n1)"
           test -n "$ZH" || { echo "zygisk.hpp nao encontrado"; exit 1; }
           cp "$ZH" src/zygisk.hpp
-          git clone --depth 1 https://github.com/jmpews/Dobby.git src/Dobby
-
-          # Correcao: o Dobby usa sintaxe de assembly da Apple (@PAGE/@PAGEOFF)
-          # que o compilador do Android nao aceita. Troca pela sintaxe ELF (:lo12:).
-          grep -rlE '@PAGE(OFF)?' src/Dobby | while read -r f; do
-            echo "Corrigindo: $f"
-            sed -i -E 's/(^|[[:space:],])([^[:space:],]+)@PAGEOFF/\1:lo12:\2/g; s/@PAGE//g' "$f"
-          done
-          echo "--- restos de @PAGE (deve ficar vazio) ---"
-          grep -rn '@PAGE' src/Dobby || true
-          echo "--- linhas com :lo12: ---"
-          grep -rn 'lo12' src/Dobby || true
+          # clone completo (com historico) para poder testar versoes mais antigas
+          git clone https://github.com/jmpews/Dobby.git /tmp/Dobby-full
 
       - name: Compilar (arm64-v8a)
         run: |
-          NDK="${ANDROID_NDK_LATEST_HOME:-${ANDROID_NDK_HOME:-$ANDROID_NDK_ROOT}}"
-          echo "NDK: $NDK"
+          cat > build_one.sh <<'EOS'
+          #!/usr/bin/env bash
+          set -euo pipefail
+          DATE="${1:-}"
+          NDK="${ANDROID_NDK_LATEST_HOME:-${ANDROID_NDK_HOME:-${ANDROID_NDK_ROOT:-}}}"
+          rm -rf src/Dobby build
+          cp -r /tmp/Dobby-full src/Dobby
+          if [ -n "$DATE" ]; then
+            C="$(git -C src/Dobby rev-list -n 1 --before="$DATE" HEAD)"
+            test -n "$C"
+            git -C src/Dobby checkout -q "$C"
+          fi
+          echo "=== Dobby: $(git -C src/Dobby log -1 --format='%h %ad' --date=short) ==="
+          # Correcao: sintaxe de assembly da Apple (@PAGE/@PAGEOFF) -> sintaxe ELF (:lo12:)
+          grep -rlE '@PAGE(OFF)?' src/Dobby | while read -r f; do
+            sed -i -E 's/(^|[[:space:],])([^[:space:],]+)@PAGEOFF/\1:lo12:\2/g; s/@PAGE//g' "$f"
+          done || true
           cmake -S src -B build \
             -DCMAKE_TOOLCHAIN_FILE="$NDK/build/cmake/android.toolchain.cmake" \
             -DANDROID_ABI=arm64-v8a \
@@ -225,6 +234,26 @@ jobs:
             -DCMAKE_CXX_FLAGS="-Wno-error"
           cmake --build build -j"$(nproc)"
           cp build/libgpuspoof.so module/zygisk/arm64-v8a.so
+          EOS
+          chmod +x build_one.sh
+
+          OK=0
+          for D in "" 2025-06-01 2025-01-01 2024-06-01 2024-01-01 2023-06-01 2023-01-01 2022-06-01; do
+            echo "##### Tentativa: Dobby ${D:-mais recente} #####"
+            if ./build_one.sh "$D" > /tmp/build.log 2>&1; then
+              grep '=== Dobby' /tmp/build.log || true
+              echo "SUCESSO"
+              OK=1
+              break
+            fi
+            grep '=== Dobby' /tmp/build.log || true
+            grep -E 'error' /tmp/build.log | head -6 || true
+          done
+          if [ "$OK" != 1 ]; then
+            echo "Todas as tentativas falharam. Fim do ultimo log:"
+            tail -50 /tmp/build.log
+            exit 1
+          fi
 
       - name: Verificar o .so gerado
         run: |
