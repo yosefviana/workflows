@@ -1,0 +1,241 @@
+name: Build Minecraft GPU Spoof (Zygisk)
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - ".github/workflows/build.yml"
+
+# ==============================================================
+# CONFIGURACAO - edite aqui se precisar e salve (o build roda de novo)
+# ==============================================================
+env:
+  TARGET_PACKAGE: "com.mojang.minecraftpe"
+  SPOOF_RENDERER: "Adreno (TM) 640"
+  SPOOF_VENDOR: ""     # vazio = nao altera
+  SPOOF_VERSION: ""    # vazio = nao altera (cuidado: pode quebrar o jogo)
+  SPOOF_VULKAN: "1"    # 1 = tambem altera o nome da GPU no Vulkan
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Gerar codigo-fonte do modulo
+        run: |
+          mkdir -p src module/META-INF/com/google/android module/zygisk
+
+          cat > src/config.h <<EOF
+          #define TARGET_PACKAGE "${TARGET_PACKAGE}"
+          #define SPOOF_RENDERER "${SPOOF_RENDERER}"
+          #define SPOOF_VENDOR "${SPOOF_VENDOR}"
+          #define SPOOF_VERSION "${SPOOF_VERSION}"
+          #define SPOOF_VULKAN ${SPOOF_VULKAN}
+          EOF
+
+          cat > src/CMakeLists.txt <<'EOF'
+          cmake_minimum_required(VERSION 3.18)
+          project(gpuspoof LANGUAGES C CXX)
+          set(CMAKE_CXX_STANDARD 17)
+          set(CMAKE_POSITION_INDEPENDENT_CODE ON)
+          set(DOBBY_GENERATE_SHARED OFF CACHE BOOL "" FORCE)
+          add_subdirectory(Dobby dobby_build)
+          add_library(gpuspoof SHARED main.cpp)
+          target_link_libraries(gpuspoof dobby log)
+          EOF
+
+          cat > src/main.cpp <<'EOF'
+          #include <android/log.h>
+          #include <dlfcn.h>
+          #include <jni.h>
+          #include <cstddef>
+          #include <cstring>
+
+          #include "config.h"
+          #include "zygisk.hpp"
+
+          extern "C" int DobbyHook(void *address, void *replace_func, void **origin_func);
+
+          #define TAG "GpuSpoof"
+          #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, TAG, __VA_ARGS__)
+
+          #define GL_VENDOR 0x1F00
+          #define GL_RENDERER 0x1F01
+          #define GL_VERSION 0x1F02
+
+          static int g_logCount = 0;
+
+          // ---------------- OpenGL ES ----------------
+          typedef const unsigned char *(*glGetString_t)(unsigned int);
+
+          static const unsigned char *filter_gl(unsigned int name, const unsigned char *res) {
+              const char *repl = nullptr;
+              if (name == GL_RENDERER) repl = SPOOF_RENDERER;
+              else if (name == GL_VENDOR && SPOOF_VENDOR[0]) repl = SPOOF_VENDOR;
+              else if (name == GL_VERSION && SPOOF_VERSION[0]) repl = SPOOF_VERSION;
+              if (!repl) return res;
+              if (g_logCount++ < 30)
+                  LOGI("glGetString(0x%x): '%s' -> '%s'", name, res ? (const char *) res : "(null)", repl);
+              return reinterpret_cast<const unsigned char *>(repl);
+          }
+
+          static glGetString_t orig_gl_0 = nullptr;
+          static glGetString_t orig_gl_1 = nullptr;
+          static const unsigned char *my_gl_0(unsigned int n) { return filter_gl(n, orig_gl_0 ? orig_gl_0(n) : nullptr); }
+          static const unsigned char *my_gl_1(unsigned int n) { return filter_gl(n, orig_gl_1 ? orig_gl_1(n) : nullptr); }
+
+          // ---------------- Vulkan ----------------
+          typedef void (*vk_props_t)(void *, void *);
+          static vk_props_t orig_vk_0 = nullptr, orig_vk_1 = nullptr, orig_vk_2 = nullptr;
+
+          // VkPhysicalDeviceProperties: deviceName fica no offset 20.
+          // VkPhysicalDeviceProperties2 (arm64): properties comeca no offset 16 -> deviceName no 36.
+          static void patch_vk_name(void *props, size_t off) {
+              char *name = reinterpret_cast<char *>(props) + off;
+              if (g_logCount++ < 30) LOGI("Vulkan deviceName '%s' -> '%s'", name, SPOOF_RENDERER);
+              strncpy(name, SPOOF_RENDERER, 255);
+              name[255] = 0;
+          }
+          static void my_vk_0(void *d, void *p) { orig_vk_0(d, p); patch_vk_name(p, 20); }
+          static void my_vk_1(void *d, void *p) { orig_vk_1(d, p); patch_vk_name(p, 36); }
+          static void my_vk_2(void *d, void *p) { orig_vk_2(d, p); patch_vk_name(p, 36); }
+
+          // ---------------- Instalacao dos hooks ----------------
+          static void *g_hooked[8];
+          static int g_nhooked = 0;
+
+          static bool already_hooked(void *a) {
+              for (int i = 0; i < g_nhooked; i++) if (g_hooked[i] == a) return true;
+              return false;
+          }
+
+          static void hook(const char *lib, const char *sym, void *repl, void **orig) {
+              void *h = dlopen(lib, RTLD_NOW);
+              if (!h) { LOGI("dlopen(%s) falhou: %s", lib, dlerror()); return; }
+              void *addr = dlsym(h, sym);
+              if (!addr) { LOGI("%s nao encontrado em %s", sym, lib); return; }
+              if (already_hooked(addr)) { LOGI("%s (%s) ja tinha hook, pulando", sym, lib); return; }
+              int r = DobbyHook(addr, repl, orig);
+              LOGI("hook %s em %s -> resultado %d", sym, lib, r);
+              if (r == 0 && g_nhooked < 8) g_hooked[g_nhooked++] = addr;
+          }
+
+          static void install_hooks() {
+              LOGI("instalando hooks em %s (renderer falso: %s)", TARGET_PACKAGE, SPOOF_RENDERER);
+              hook("libGLESv2.so", "glGetString", reinterpret_cast<void *>(my_gl_0), reinterpret_cast<void **>(&orig_gl_0));
+              hook("libGLESv3.so", "glGetString", reinterpret_cast<void *>(my_gl_1), reinterpret_cast<void **>(&orig_gl_1));
+          #if SPOOF_VULKAN
+              hook("libvulkan.so", "vkGetPhysicalDeviceProperties", reinterpret_cast<void *>(my_vk_0), reinterpret_cast<void **>(&orig_vk_0));
+              hook("libvulkan.so", "vkGetPhysicalDeviceProperties2", reinterpret_cast<void *>(my_vk_1), reinterpret_cast<void **>(&orig_vk_1));
+              hook("libvulkan.so", "vkGetPhysicalDeviceProperties2KHR", reinterpret_cast<void *>(my_vk_2), reinterpret_cast<void **>(&orig_vk_2));
+          #endif
+          }
+
+          // ---------------- Modulo Zygisk ----------------
+          class GpuSpoofModule : public zygisk::ModuleBase {
+          public:
+              void onLoad(zygisk::Api *api, JNIEnv *env) override {
+                  this->api = api;
+                  this->env = env;
+              }
+
+              void preAppSpecialize(zygisk::AppSpecializeArgs *args) override {
+                  const char *name = env->GetStringUTFChars(args->nice_name, nullptr);
+                  if (name) {
+                      isTarget = strcmp(name, TARGET_PACKAGE) == 0;
+                      env->ReleaseStringUTFChars(args->nice_name, name);
+                  }
+                  // Nao e o Minecraft: descarrega o modulo para nao deixar rastro no app.
+                  if (!isTarget) api->setOption(zygisk::Option::DLCLOSE_MODULE_LIBRARY);
+              }
+
+              void postAppSpecialize(const zygisk::AppSpecializeArgs *) override {
+                  if (isTarget) install_hooks();
+              }
+
+          private:
+              zygisk::Api *api = nullptr;
+              JNIEnv *env = nullptr;
+              bool isTarget = false;
+          };
+
+          REGISTER_ZYGISK_MODULE(GpuSpoofModule)
+          EOF
+
+          cat > module/module.prop <<'EOF'
+          id=mcgpuspoof
+          name=Minecraft GPU Spoof
+          version=v1.0
+          versionCode=1
+          author=voce
+          description=Faz o Minecraft Bedrock enxergar a GPU como Adreno 640 para liberar os Visuais Vibrantes. Requer Zygisk.
+          EOF
+
+          echo "#MAGISK" > module/META-INF/com/google/android/updater-script
+
+          cat > module/META-INF/com/google/android/update-binary <<'EOF'
+          #!/sbin/sh
+          umask 022
+          ui_print() { echo "$1"; }
+          require_new_magisk() {
+            ui_print "*******************************"
+            ui_print " Please install Magisk v20.4+! "
+            ui_print "*******************************"
+            exit 1
+          }
+          OUTFD=$2
+          ZIPFILE=$3
+          mount /data 2>/dev/null
+          [ -f /data/adb/magisk/util_functions.sh ] || require_new_magisk
+          . /data/adb/magisk/util_functions.sh
+          [ $MAGISK_VER_CODE -lt 20400 ] && require_new_magisk
+          install_module
+          exit 0
+          EOF
+
+      - name: Baixar dependencias (zygisk.hpp e Dobby)
+        run: |
+          git clone --depth 1 https://github.com/topjohnwu/zygisk-module-sample.git /tmp/zsample
+          ZH="$(find /tmp/zsample -name zygisk.hpp | head -n1)"
+          test -n "$ZH" || { echo "zygisk.hpp nao encontrado"; exit 1; }
+          cp "$ZH" src/zygisk.hpp
+          git clone --depth 1 https://github.com/jmpews/Dobby.git src/Dobby
+
+      - name: Compilar (arm64-v8a)
+        run: |
+          NDK="${ANDROID_NDK_LATEST_HOME:-${ANDROID_NDK_HOME:-$ANDROID_NDK_ROOT}}"
+          echo "NDK: $NDK"
+          cmake -S src -B build \
+            -DCMAKE_TOOLCHAIN_FILE="$NDK/build/cmake/android.toolchain.cmake" \
+            -DANDROID_ABI=arm64-v8a \
+            -DANDROID_PLATFORM=android-26 \
+            -DANDROID_STL=c++_static \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_POLICY_VERSION_MINIMUM=3.5 \
+            -DCMAKE_CXX_FLAGS="-Wno-error"
+          cmake --build build -j"$(nproc)"
+          cp build/libgpuspoof.so module/zygisk/arm64-v8a.so
+
+      - name: Verificar o .so gerado
+        run: |
+          NDK="${ANDROID_NDK_LATEST_HOME:-${ANDROID_NDK_HOME:-$ANDROID_NDK_ROOT}}"
+          BIN="$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin"
+          SO=module/zygisk/arm64-v8a.so
+          ls -l "$SO"
+          echo "--- dependencias (NEEDED) ---"
+          "$BIN/llvm-readelf" -d "$SO" | grep NEEDED || true
+          if "$BIN/llvm-readelf" -d "$SO" | grep -qi dobby; then
+            echo "ERRO: o modulo depende de uma libdobby.so externa"; exit 1
+          fi
+          "$BIN/llvm-nm" -D "$SO" | grep -q zygisk_module_entry || { echo "ERRO: zygisk_module_entry nao exportado"; exit 1; }
+          if "$BIN/llvm-nm" -D --undefined-only "$SO" | grep -q DobbyHook; then
+            echo "ERRO: DobbyHook ficou indefinido (Dobby nao foi linkado)"; exit 1
+          fi
+          find module -type f
+
+      - name: Publicar o modulo (zip pronto para o Magisk)
+        uses: actions/upload-artifact@v4
+        with:
+          name: GpuSpoof-Magisk
+          path: module/
+          if-no-files-found: error
+          compression-level: 0
